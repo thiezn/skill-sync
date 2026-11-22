@@ -35,8 +35,23 @@ impl From<std::io::Error> for Error {
 
 impl From<git2::Error> for Error {
     fn from(source: git2::Error) -> Self {
-        Self::with_source("Git operation failed", source)
+        Self::with_source(format!("Git operation failed: {source}"), source)
     }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+
+    #[test]
+    fn git_errors_include_the_underlying_message() {
+        let error = Error::from(git2::Error::from_str("remote rejected the update"));
+
+        assert_eq!(
+            error.to_string(),
+            "Git operation failed: remote rejected the update"
+        );
+    }
+}

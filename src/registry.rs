@@ -3,15 +3,12 @@ use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
-use git2::build::RepoBuilder;
 use git2::{
-    BranchType, Cred, CredentialType, FetchOptions, IndexAddOption, PushOptions, RemoteCallbacks,
-    Repository, Signature,
+    BranchType, Config, Cred, CredentialType, FetchOptions, IndexAddOption, PushOptions,
+    RemoteCallbacks, Repository, Signature,
 };
 
 use crate::{Error, Result};
-
-pub const DEFAULT_REGISTRY_URL: &str = "https://github.com/thiezn/skills.git";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Skill {
@@ -35,24 +32,43 @@ pub enum UpdateOutcome {
 pub struct SkillRegistry {
     remote_url: String,
     local_skills_dir: PathBuf,
+    registry_dir: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct SkillRegistrySet {
+    registries: Vec<(String, SkillRegistry)>,
 }
 
 struct Checkout {
-    _directory: tempfile::TempDir,
     path: PathBuf,
     repository: Repository,
 }
 
 impl SkillRegistry {
     pub fn new(remote_url: impl Into<String>, local_skills_dir: impl Into<PathBuf>) -> Self {
+        let remote_url = remote_url.into();
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let cache_root = home.join(".utl").join("skills");
+        let registry_dir = registry_cache_dir(&cache_root, &remote_url);
+
         Self {
-            remote_url: remote_url.into(),
+            remote_url,
             local_skills_dir: local_skills_dir.into(),
+            registry_dir,
         }
     }
 
-    pub fn with_default_registry(local_skills_dir: impl Into<PathBuf>) -> Self {
-        Self::new(DEFAULT_REGISTRY_URL, local_skills_dir)
+    pub fn new_with_cache_dir(
+        remote_url: impl Into<String>,
+        local_skills_dir: impl Into<PathBuf>,
+        registry_dir: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            remote_url: remote_url.into(),
+            local_skills_dir: local_skills_dir.into(),
+            registry_dir: registry_dir.into(),
+        }
     }
 
     pub fn list(&self) -> Result<Vec<Skill>> {
@@ -134,12 +150,14 @@ impl SkillRegistry {
         identity: Option<(&str, &str)>,
     ) -> Result<UpdateOutcome> {
         let skill_name = validate_skill_name(skill_name)?;
-        let local_path = self.local_skills_dir.join(&skill_name);
-        ensure_skill_directory(&local_path, &skill_name)?;
-
         let checkout = self.clone_registry()?;
-        checkout_main(&checkout.repository)?;
-
+        let local_path = self.local_skills_dir.join(&skill_name);
+        if !local_path.is_dir() {
+            return Err(Error::new(format!(
+                "Local skill '{skill_name}' was not found in '{}'",
+                self.local_skills_dir.display()
+            )));
+        }
         let remote_path = checkout.path.join("skills").join(&skill_name);
         fs::create_dir_all(
             remote_path.parent().ok_or_else(|| {
@@ -158,17 +176,19 @@ impl SkillRegistry {
         let tree = repository.find_tree(tree_oid)?;
         let parent = repository.head()?.peel_to_commit()?;
         if parent.tree_id() == tree_oid {
-            return Ok(UpdateOutcome::Unchanged);
+            let remote_main = repository
+                .find_reference("refs/remotes/origin/main")?
+                .peel_to_commit()?;
+            if parent.id() == remote_main.id() {
+                return Ok(UpdateOutcome::Unchanged);
+            }
+            push_main(repository)?;
+            return Ok(UpdateOutcome::Updated);
         }
 
         let signature = match identity {
             Some((name, email)) => Signature::now(name, email)?,
-            None => repository.signature().map_err(|error| {
-                Error::with_source(
-                    "Git author identity is missing; configure user.name and user.email",
-                    error,
-                )
-            })?,
+            None => configured_signature(repository)?,
         };
         let message = format!("Update skill '{skill_name}'");
         repository.commit(
@@ -180,10 +200,7 @@ impl SkillRegistry {
             &[&parent],
         )?;
 
-        let mut remote = repository.find_remote("origin")?;
-        let mut options = PushOptions::new();
-        options.remote_callbacks(remote_callbacks());
-        remote.push(&["refs/heads/main:refs/heads/main"], Some(&mut options))?;
+        push_main(repository)?;
 
         Ok(UpdateOutcome::Updated)
     }
@@ -193,18 +210,75 @@ impl SkillRegistry {
     }
 
     fn clone_registry(&self) -> Result<Checkout> {
-        let checkout_dir = tempfile::tempdir()?;
-        let path = checkout_dir.path().join("registry");
-        let mut fetch_options = FetchOptions::new();
-        fetch_options.remote_callbacks(remote_callbacks());
-        let mut builder = RepoBuilder::new();
-        builder.fetch_options(fetch_options);
-        let repository = builder.clone(&self.remote_url, &path)?;
+        let registry_dir = self.resolved_registry_dir();
+        let parent = registry_dir
+            .parent()
+            .ok_or_else(|| Error::new("Registry cache directory has no parent"))?;
+        fs::create_dir_all(parent)?;
+
+        let mut created = false;
+        if !registry_dir.exists() {
+            let staging = tempfile::Builder::new()
+                .prefix(".skills-sync-")
+                .tempdir_in(parent)?;
+            let staging_path = staging.path().join("registry");
+            let repository = Repository::init(&staging_path)?;
+            repository.remote("origin", &self.remote_url)?;
+            let mut config = repository.config()?;
+            config.set_str(
+                "remote.origin.fetch",
+                "+refs/heads/main:refs/remotes/origin/main",
+            )?;
+            drop(config);
+            fetch_main(&repository, &self.remote_url)?;
+            checkout_main(&repository, false)?;
+            drop(repository);
+            if let Err(error) = fs::rename(&staging_path, &registry_dir) {
+                if !registry_dir.exists() {
+                    return Err(Error::from(error));
+                }
+            } else {
+                created = true;
+            }
+        }
+
+        let repository = Repository::open(&registry_dir)?;
+        if repository.config()?.get_string("remote.origin.url")? != self.remote_url {
+            return Err(Error::new(format!(
+                "Registry cache at '{}' points to a different remote",
+                registry_dir.display()
+            )));
+        }
+
+        if !created {
+            fetch_main(&repository, &self.remote_url)?;
+        }
+        let preserve_local_main = !created && local_main_is_ahead_of_remote(&repository)?;
+        checkout_main(&repository, preserve_local_main)?;
+
         Ok(Checkout {
-            _directory: checkout_dir,
-            path,
+            path: registry_dir,
             repository,
         })
+    }
+
+    fn resolved_registry_dir(&self) -> PathBuf {
+        if !self.registry_dir.exists()
+            || registry_cache_matches(&self.registry_dir, &self.remote_url)
+        {
+            return self.registry_dir.clone();
+        }
+
+        let hash = blake3::hash(self.remote_url.as_bytes())
+            .to_hex()
+            .to_string();
+        let name = self
+            .registry_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("repository");
+        self.registry_dir
+            .with_file_name(format!("{name}-{}", &hash[..12]))
     }
 
     fn sync_from_checkout(
@@ -230,6 +304,193 @@ impl SkillRegistry {
         replace_directory(&remote_path, &local_path)?;
         Ok(SyncOutcome::Synced)
     }
+}
+
+impl SkillRegistrySet {
+    pub fn new<I, S>(remote_urls: I, local_skills_dir: impl Into<PathBuf>) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let local_skills_dir = local_skills_dir.into();
+        let registries = remote_urls
+            .into_iter()
+            .map(|remote_url| {
+                let remote_url = remote_url.into();
+                let registry = SkillRegistry::new(&remote_url, &local_skills_dir);
+                (remote_url, registry)
+            })
+            .collect();
+        Self { registries }
+    }
+
+    pub fn from_registries(registries: impl IntoIterator<Item = SkillRegistry>) -> Self {
+        Self {
+            registries: registries
+                .into_iter()
+                .map(|registry| (registry.remote_url.clone(), registry))
+                .collect(),
+        }
+    }
+
+    pub fn list(&self) -> Result<Vec<Skill>> {
+        Ok(self
+            .list_owned_skills()?
+            .into_iter()
+            .map(|(_, skill)| skill)
+            .collect())
+    }
+
+    pub fn sync_many<S>(
+        &self,
+        skill_names: &[S],
+        overwrite: bool,
+    ) -> Result<Vec<(String, SyncOutcome)>>
+    where
+        S: AsRef<str>,
+    {
+        let owned_skills = self.list_owned_skills()?;
+        let selected = skill_names
+            .iter()
+            .map(|skill_name| {
+                let skill_name = skill_name.as_ref();
+                owned_skills
+                    .iter()
+                    .find(|(_, skill)| skill.name == skill_name)
+                    .map(|(index, skill)| (*index, skill.name.clone()))
+                    .ok_or_else(|| {
+                        Error::new(format!(
+                            "Skill '{skill_name}' was not found in the selected repositories"
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.sync_owned_skills(&selected, overwrite)
+    }
+
+    pub fn sync_all(&self, overwrite: bool) -> Result<Vec<(String, SyncOutcome)>> {
+        let selected = self
+            .list_owned_skills()?
+            .into_iter()
+            .map(|(index, skill)| (index, skill.name))
+            .collect::<Vec<_>>();
+        self.sync_owned_skills(&selected, overwrite)
+    }
+
+    pub fn update(&self, skill_name: &str) -> Result<UpdateOutcome> {
+        self.update_with_optional_identity(skill_name, None)
+    }
+
+    pub fn update_with_identity(
+        &self,
+        skill_name: &str,
+        author_name: &str,
+        author_email: &str,
+    ) -> Result<UpdateOutcome> {
+        self.update_with_optional_identity(skill_name, Some((author_name, author_email)))
+    }
+
+    fn update_with_optional_identity(
+        &self,
+        skill_name: &str,
+        identity: Option<(&str, &str)>,
+    ) -> Result<UpdateOutcome> {
+        let owned_skills = self.list_owned_skills()?;
+        let registry_index = owned_skills
+            .iter()
+            .find(|(_, skill)| skill.name == skill_name)
+            .map(|(index, _)| *index)
+            .or_else(|| (self.registries.len() == 1).then_some(0))
+            .ok_or_else(|| {
+                Error::new(format!(
+                    "Skill '{skill_name}' was not found in the selected repositories; adding a skill requires selecting one repository"
+                ))
+            })?;
+        let registry = &self.registries[registry_index].1;
+        match identity {
+            Some((name, email)) => registry.update_with_identity(skill_name, name, email),
+            None => registry.update(skill_name),
+        }
+    }
+
+    fn list_owned_skills(&self) -> Result<Vec<(usize, Skill)>> {
+        let mut owners = std::collections::HashMap::<String, usize>::new();
+        let mut skills = Vec::new();
+
+        for (registry_index, (repository, registry)) in self.registries.iter().enumerate() {
+            for skill in registry.list()? {
+                if let Some(first_registry_index) = owners.get(&skill.name) {
+                    return Err(Error::new(format!(
+                        "Duplicate skill name '{}' found in repositories '{}' and '{}'",
+                        skill.name, self.registries[*first_registry_index].0, repository
+                    )));
+                }
+                owners.insert(skill.name.clone(), registry_index);
+                skills.push((registry_index, skill));
+            }
+        }
+
+        skills.sort_by(|left, right| left.1.name.cmp(&right.1.name));
+        Ok(skills)
+    }
+
+    fn sync_owned_skills(
+        &self,
+        selected: &[(usize, String)],
+        overwrite: bool,
+    ) -> Result<Vec<(String, SyncOutcome)>> {
+        let mut skills_by_registry = vec![Vec::new(); self.registries.len()];
+        for (registry_index, skill_name) in selected {
+            skills_by_registry[*registry_index].push(skill_name.clone());
+        }
+
+        let mut outcomes = Vec::new();
+        for ((_, registry), skill_names) in self.registries.iter().zip(skills_by_registry) {
+            if skill_names.is_empty() {
+                continue;
+            }
+            outcomes.extend(registry.sync_many(&skill_names, overwrite)?);
+        }
+        Ok(outcomes)
+    }
+}
+
+fn registry_cache_dir(cache_root: &Path, remote_url: &str) -> PathBuf {
+    let remote_name = remote_url
+        .trim_end_matches('/')
+        .rsplit(['/', ':'])
+        .next()
+        .unwrap_or("repository");
+    let remote_name = remote_name.strip_suffix(".git").unwrap_or(remote_name);
+    let safe_name = remote_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let safe_name = safe_name.trim_matches('.');
+    if safe_name.is_empty() {
+        cache_root.join("repository")
+    } else {
+        cache_root.join(safe_name)
+    }
+}
+
+fn registry_cache_matches(path: &Path, remote_url: &str) -> bool {
+    Repository::open(path)
+        .ok()
+        .and_then(|repository| {
+            repository
+                .config()
+                .ok()?
+                .get_string("remote.origin.url")
+                .ok()
+        })
+        .is_some_and(|cached_url| cached_url == remote_url)
 }
 
 fn validate_skill_name(skill_name: &str) -> Result<String> {
@@ -435,7 +696,71 @@ fn copy_symlink(_source: &Path, _destination: &Path) -> Result<()> {
     ))
 }
 
-fn checkout_main(repository: &Repository) -> Result<()> {
+fn configured_signature(repository: &Repository) -> Result<Signature<'static>> {
+    let config = repository.config()?;
+    let identity = "Git author identity is missing; configure user.name and user.email";
+    let name = config
+        .get_string("user.name")
+        .map_err(|_| Error::new(identity))?;
+    let email = config
+        .get_string("user.email")
+        .map_err(|_| Error::new(identity))?;
+    Signature::now(&name, &email).map_err(Into::into)
+}
+
+fn supports_shallow_fetch(remote_url: &str) -> bool {
+    !remote_url.starts_with("file://") && !Path::new(remote_url).exists()
+}
+
+fn fetch_main(repository: &Repository, remote_url: &str) -> Result<()> {
+    if repository.config()?.get_string("remote.origin.url")? != remote_url {
+        return Err(Error::new("Registry cache points to a different remote"));
+    }
+
+    let mut remote = repository.find_remote("origin")?;
+    let mut fetch_options = FetchOptions::new();
+    if supports_shallow_fetch(remote_url) {
+        fetch_options.depth(1);
+    }
+    fetch_options.remote_callbacks(remote_callbacks()?);
+    remote.fetch(
+        &["+refs/heads/main:refs/remotes/origin/main"],
+        Some(&mut fetch_options),
+        None,
+    )?;
+    Ok(())
+}
+
+fn local_main_is_ahead_of_remote(repository: &Repository) -> Result<bool> {
+    let Ok(local_main) = repository.find_reference("refs/heads/main") else {
+        return Ok(false);
+    };
+    let Ok(remote_main) = repository.find_reference("refs/remotes/origin/main") else {
+        return Ok(false);
+    };
+    let local_id = local_main
+        .target()
+        .ok_or_else(|| Error::new("Cached main branch does not point to a commit"))?;
+    let remote_id = remote_main
+        .target()
+        .ok_or_else(|| Error::new("Cached origin/main branch does not point to a commit"))?;
+
+    if local_id == remote_id {
+        return Ok(false);
+    }
+    if repository.graph_descendant_of(local_id, remote_id)? {
+        return Ok(true);
+    }
+    if repository.graph_descendant_of(remote_id, local_id)? {
+        return Ok(false);
+    }
+
+    Err(Error::new(
+        "Cached main and origin/main have diverged; refusing to reset local commits",
+    ))
+}
+
+fn checkout_main(repository: &Repository, preserve_local_main: bool) -> Result<()> {
     let remote_main = repository
         .find_branch("origin/main", BranchType::Remote)
         .map_err(|error| Error::with_source("The registry does not have a main branch", error))?;
@@ -444,30 +769,66 @@ fn checkout_main(repository: &Repository) -> Result<()> {
         repository.branch("main", &commit, false)?;
     }
     repository.set_head("refs/heads/main")?;
-    repository.checkout_head(None)?;
+    if !preserve_local_main {
+        repository.reset(commit.as_object(), git2::ResetType::Hard, None)?;
+    }
     Ok(())
 }
 
-fn remote_callbacks<'a>() -> RemoteCallbacks<'a> {
-    let mut callbacks = RemoteCallbacks::new();
-    callbacks.credentials(credentials);
-    callbacks
+fn push_main(repository: &Repository) -> Result<()> {
+    let mut remote = repository.find_remote("origin")?;
+    let mut options = PushOptions::new();
+    options.remote_callbacks(remote_callbacks()?);
+    remote
+        .push(&["refs/heads/main:refs/heads/main"], Some(&mut options))
+        .map_err(|error| {
+            Error::with_source(
+                format!("Could not push skill updates to origin/main: {error}"),
+                error,
+            )
+        })
 }
 
-fn credentials(
-    _url: &str,
-    username: Option<&str>,
-    allowed: CredentialType,
-) -> std::result::Result<Cred, git2::Error> {
-    if allowed.contains(CredentialType::SSH_KEY) {
-        return Cred::ssh_key_from_agent(username.unwrap_or("git"));
-    }
+fn remote_callbacks<'a>() -> Result<RemoteCallbacks<'a>> {
+    let config = Config::open_default()?;
+    let mut callbacks = RemoteCallbacks::new();
+    callbacks.credentials(move |url, username, allowed| {
+        if let Ok(credential) = Cred::credential_helper(&config, url, username) {
+            return Ok(credential);
+        }
 
-    if allowed.contains(CredentialType::USER_PASS_PLAINTEXT)
-        && let Ok(token) = env::var("GITHUB_TOKEN").or_else(|_| env::var("GH_TOKEN"))
-    {
-        return Cred::userpass_plaintext(username.unwrap_or("x-access-token"), &token);
-    }
+        if allowed.contains(CredentialType::USER_PASS_PLAINTEXT)
+            && let Ok(token) = env::var("GITHUB_TOKEN").or_else(|_| env::var("GH_TOKEN"))
+        {
+            return Cred::userpass_plaintext(username.unwrap_or("x-access-token"), &token);
+        }
 
-    Cred::default()
+        if allowed.contains(CredentialType::SSH_KEY) {
+            return Cred::ssh_key_from_agent(username.unwrap_or("git"));
+        }
+
+        if allowed.contains(CredentialType::USERNAME) {
+            return Cred::username(username.unwrap_or("git"));
+        }
+
+        Cred::default()
+    });
+    Ok(callbacks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::registry_cache_dir;
+    use std::path::Path;
+
+    #[test]
+    fn registry_cache_path_uses_repository_name() {
+        assert_eq!(
+            registry_cache_dir(
+                Path::new("/home/user/.utl/skills"),
+                "https://github.com/thiezn/skills.git"
+            ),
+            Path::new("/home/user/.utl/skills/skills")
+        );
+    }
 }
