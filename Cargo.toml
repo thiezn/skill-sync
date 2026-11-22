@@ -1,0 +1,18 @@
+
+[package]
+name = "skill-sync"
+version = "0.1.0"
+edition = "2024"
+description = "Skill sync tool for managing personal skills repository"
+license = "APACHE-2.0"
+readme = "README.md"
+
+[dependencies]
+blake3 = "1"
+git2 = "0"
+tempfile = "3"
+thiserror = "1"
+
+[lib]
+name = "skill_sync"
+path = "src/lib.rs"
